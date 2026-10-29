@@ -1445,7 +1445,10 @@ class DefaultRunner(Runner):
         await self._store_interaction_continuation(ctx, continuation)
 
         pending_content = ""
+        streamed_content = ""
+        text_event_count = 0
         has_response = False
+        final_response = False
         terminal = False
         usage: dict[str, typing.Any] | None = None
         async for event in client.workflow_submit(
@@ -1468,24 +1471,43 @@ class DefaultRunner(Runner):
                     if event_type != "text_chunk"
                     else str(event.get("data", {}).get("text") or "")
                 )
-                if len(pending_content) + len(chunk) > 1024 * 1024:
+                if event_type != "text_chunk" and pending_content and chunk.startswith(pending_content):
+                    next_content = chunk
+                else:
+                    next_content = pending_content + chunk
+                if len(next_content) > 1024 * 1024:
                     raise DifyAPIError("Dify response exceeds the runtime limit", code="dify.response_limit")
-                pending_content += chunk
+                pending_content = next_content
+                text_event_count += 1
+                if text_event_count % 8 == 0:
+                    content, _ = process_thinking_content(pending_content, remove_think)
+                    if content and content != streamed_content:
+                        streamed_content = content
+                        has_response = True
+                        yield RunnerResult.message_delta(
+                            ctx.run_id,
+                            MessageChunk(role="assistant", content=content, is_final=False),
+                        )
             elif event_type == "node_finished":
                 data = event.get("data", {})
                 if data.get("node_type") == "answer":
                     answer = extract_text_from_output(data.get("outputs", {}).get("answer"))
                     if answer:
                         content, _ = process_thinking_content(answer, remove_think)
-                        has_response = True
-                        yield RunnerResult.message_delta(
-                            ctx.run_id,
-                            MessageChunk(role="assistant", content=content, is_final=True),
-                        )
+                        final_response = bool(content)
+                        if content and content != streamed_content:
+                            has_response = True
+                            streamed_content = content
+                            yield RunnerResult.message_delta(
+                                ctx.run_id,
+                                MessageChunk(role="assistant", content=content, is_final=True),
+                            )
             elif event_type in {"workflow_paused", "human_input_required"}:
                 if pending_content:
                     content, _ = process_thinking_content(pending_content, remove_think)
-                    if content:
+                    if content and content != streamed_content:
+                        has_response = True
+                        streamed_content = content
                         yield RunnerResult.message_delta(
                             ctx.run_id,
                             MessageChunk(role="assistant", content=content, is_final=True),
@@ -1517,26 +1539,29 @@ class DefaultRunner(Runner):
                 summary = extract_text_from_output(data.get("outputs", {}).get("summary", ""))
                 if summary:
                     content, _ = process_thinking_content(summary, remove_think)
-                    has_response = True
-                    yield RunnerResult.message_delta(
-                        ctx.run_id,
-                        MessageChunk(role="assistant", content=content, is_final=True),
-                    )
+                    final_response = bool(content)
+                    if content and content != streamed_content:
+                        has_response = True
+                        streamed_content = content
+                        yield RunnerResult.message_delta(
+                            ctx.run_id,
+                            MessageChunk(role="assistant", content=content, is_final=True),
+                        )
                 terminal = True
 
-        if pending_content and not has_response:
-            content, _ = process_thinking_content(pending_content, remove_think)
-            if content:
-                has_response = True
-                yield RunnerResult.message_delta(
-                    ctx.run_id,
-                    MessageChunk(role="assistant", content=content, is_final=True),
-                )
         if not terminal:
             raise DifyAPIError(
                 "Dify workflow resume ended before a terminal event",
                 code="dify.response_invalid",
             )
+        if pending_content and not final_response:
+            content, _ = process_thinking_content(pending_content, remove_think)
+            if content and content != streamed_content:
+                has_response = True
+                yield RunnerResult.message_delta(
+                    ctx.run_id,
+                    MessageChunk(role="assistant", content=content, is_final=True),
+                )
         if not has_response:
             raise DifyAPIError(
                 "Dify workflow returned no response after human input",
